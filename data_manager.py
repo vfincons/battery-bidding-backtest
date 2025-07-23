@@ -28,6 +28,10 @@ class DataManager:
         self.rrp_data: Optional[pd.DataFrame] = None
         self.logger = logging.getLogger(__name__)
 
+        # ADD: Simple cache with size limit
+        self._cache = {}
+        self._cache_max_size = 50  # Limit cache size
+
     def download_dispatch_price(self, start_time: str, end_time: str) -> pd.DataFrame:
         """
         Download DISPATCHPRICE for the specified region using NEMOSIS.
@@ -149,19 +153,17 @@ class DataManager:
         self.logger.info("Data integrity validation passed")
 
     def get_history_window_data(self, current_date: datetime) -> pd.DataFrame:
-        """
-        Get 28-day history window data ending on the previous day, filtered for the peak period.
+        """ENHANCED: Add caching while preserving all existing functionality"""
 
-        Parameters:
-        -----------
-        current_date : datetime
-            Current date for which to get a history window
+        # Create a cache key
+        cache_key = f"history_{current_date.date()}_{self.config.history_window_days}"
 
-        Returns:
-        --------
-        pd.DataFrame
-            Peak period RRP data for the 28-day history window
-        """
+        # Check cache first
+        if cache_key in self._cache:
+            self.logger.debug(f"Cache hit for {cache_key}")
+            return self._cache[cache_key].copy()  # Return copy to prevent mutation
+
+        # EXISTING LOGIC - UNCHANGED
         if self.rrp_data is None:
             raise ValueError("RRP data not loaded. Call load_rrp_data() first.")
 
@@ -181,6 +183,14 @@ class DataManager:
         peak_period_data = self._filter_by_peak_period(history_data)
 
         self.logger.debug(f"Found {len(peak_period_data)} peak period records in history window")
+
+        # CACHE MANAGEMENT: Store result and manage cache size
+        if len(self._cache) >= self._cache_max_size:
+            # Remove the oldest entry (simple FIFO)
+            oldest_key = next(iter(self._cache))
+            del self._cache[oldest_key]
+
+        self._cache[cache_key] = peak_period_data.copy()
 
         return peak_period_data
 

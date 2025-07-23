@@ -352,6 +352,86 @@ class BiddingStrategyManager:
 
         return profile.remaining_soc > 0.01
 
+    def update_strategy_after_dispatch(self, strategy_name: str, dispatched_mw: float,
+                                       nemde_breakdown: Dict[str, float], current_interval: int) -> bool:
+        """
+        ATOMIC update of both SOC and band allocations to maintain consistency.
+
+        NEW METHOD: Replaces separate update_after_dispatch and update_band_allocations_after_nemde_dispatch
+        """
+        if strategy_name not in self.current_profiles:
+            raise ValueError(f"Strategy '{strategy_name}' not initialized")
+
+        profile = self.current_profiles[strategy_name]
+
+        # Record pre-update state for validation
+        pre_dispatch_soc = profile.remaining_soc
+        pre_dispatch_allocations = profile.band_allocations.copy()
+
+        self.logger.debug(f"ATOMIC UPDATE - {strategy_name} Interval {current_interval}:")
+        self.logger.debug(f"  Pre-dispatch SOC: {pre_dispatch_soc:.2f}MW")
+        self.logger.debug(f"  Total dispatched: {dispatched_mw:.2f}MW")
+        self.logger.debug(f"  NEMDE breakdown: {nemde_breakdown}")
+
+        # STEP 1: Update remaining SOC
+        profile.remaining_soc = max(0, profile.remaining_soc - dispatched_mw)
+        profile.current_interval = current_interval
+
+        # STEP 2: Update band allocations based on NEMDE breakdown
+        total_reduction = 0.0
+        for band_name, dispatched_amount in nemde_breakdown.items():
+            if dispatched_amount > 0.001 and band_name in profile.band_allocations:
+                original_allocation = profile.band_allocations[band_name]
+
+                # CRITICAL: Ensure we don't reduce below zero
+                reduction = min(dispatched_amount, original_allocation)
+                new_allocation = max(0, original_allocation - reduction)
+                profile.band_allocations[band_name] = new_allocation
+                total_reduction += reduction
+
+                self.logger.debug(f"  {band_name}: {original_allocation:.2f}MW → {new_allocation:.2f}MW "
+                                  f"(reduced: {reduction:.2f}MW)")
+
+        # STEP 3: VALIDATION - Check consistency
+        post_dispatch_allocation_sum = sum(profile.band_allocations.values())
+        expected_allocation_sum = profile.remaining_soc
+
+        consistency_error = abs(post_dispatch_allocation_sum - expected_allocation_sum)
+
+        if consistency_error > 0.01:
+            self.logger.error(f"ATOMIC UPDATE CONSISTENCY ERROR - {strategy_name}:")
+            self.logger.error(f"  Remaining SOC: {profile.remaining_soc:.3f}MW")
+            self.logger.error(f"  Sum of allocations: {post_dispatch_allocation_sum:.3f}MW")
+            self.logger.error(f"  Difference: {consistency_error:.3f}MW")
+            self.logger.error(f"  Total reduction applied: {total_reduction:.3f}MW")
+            self.logger.error(f"  Expected reduction: {dispatched_mw:.3f}MW")
+
+            # RECOVERY: Force consistency by proportional scaling
+            if post_dispatch_allocation_sum > 0 and profile.remaining_soc >= 0:
+                scaling_factor = profile.remaining_soc / post_dispatch_allocation_sum
+                self.logger.warning(f"  Applying recovery scaling factor: {scaling_factor:.6f}")
+
+                for band_name in profile.band_allocations:
+                    profile.band_allocations[band_name] *= scaling_factor
+
+        else:
+            self.logger.debug(f"  ✅ Consistency check passed: difference = {consistency_error:.6f}MW")
+
+        # STEP 4: Record dispatch event
+        dispatch_event = {
+            'strategy': strategy_name,
+            'interval': current_interval,
+            'dispatched_mw': dispatched_mw,
+            'nemde_breakdown': nemde_breakdown.copy(),
+            'pre_dispatch_soc': pre_dispatch_soc,
+            'post_dispatch_soc': profile.remaining_soc,
+            'consistency_error': consistency_error,
+            'total_reduction_applied': total_reduction
+        }
+        self.dispatch_history.append(dispatch_event)
+
+        return profile.remaining_soc > 0.01
+
     def update_band_allocations_after_nemde_dispatch(self, strategy_name: str,
                                                      nemde_dispatch_breakdown: Dict[str, float]) -> None:
         """

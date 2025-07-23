@@ -14,9 +14,9 @@ class Configuration:
     def __init__(self):
         """Initialize configuration with default values."""
         # Date parameters
-        self.start_date: str = "2024/04/01 00:00:00"
-        self.end_date: str = "2024/07/31 23:55:00"
-        self.analysis_start_date: str = "2024/05/01 00:00:00"  # Allow for 28-day history
+        self.start_date: str = "2024/03/01 00:00:00"
+        self.end_date: str = "2024/08/31 23:55:00"
+        self.analysis_start_date: str = "2024/04/01 00:00:00"  # Allow for 28-day history
 
         # Peak period definition
         self.peak_period_start_time: time = time(17, 0)  # 17:00
@@ -27,7 +27,7 @@ class Configuration:
             'max_discharge_power': 100,  # MW
             'energy_capacity': 400,  # MWh (optional)
             'ramp_limits': (48, 192),  # MW/min (min, max)
-            'TLF': 0.8657  # Transmission Loss Factor
+            'TLF': 0.9  # Transmission Loss Factor
         }
 
         # Data parameters

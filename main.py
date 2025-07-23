@@ -559,6 +559,19 @@ class BatteryBacktester:
                             self._log_daily_summary(current_date.date(), daily_results)
                             successful_days += 1
 
+                            # ADD: Aggregate price band evolution
+                            if 'price_bands' in daily_results:
+                                date_key = current_date.strftime('%Y-%m-%d')
+                                self.backtest_results['price_band_evolution'][date_key] = daily_results['price_bands']
+
+                            # ADD: Aggregate market conditions
+                            if 'market_conditions' in daily_results:
+                                date_key = current_date.strftime('%Y-%m-%d')
+                                if 'market_conditions' not in self.backtest_results:
+                                    self.backtest_results['market_conditions'] = {}
+                                self.backtest_results['market_conditions'][date_key] = daily_results[
+                                    'market_conditions']
+
                     except Exception as e:
                         self.backtest_logger.log_error(e, f"Processing {current_date.date()}")
 
@@ -2055,9 +2068,9 @@ def create_default_configuration() -> Configuration:
     config = Configuration()
 
     # Set analysis period (adjust as needed)
-    config.start_date = "2024/04/01 00:00:00"
-    config.end_date = "2024/07/31 23:55:00"
-    config.analysis_start_date = "2024/05/01 00:00:00"  # Allow for 28-day history
+    config.start_date = "2024/03/01 00:00:00"
+    config.end_date = "2024/08/31 23:55:00"
+    config.analysis_start_date = "2024/04/01 00:00:00"  # Allow for 28-day history
 
     return config
 

@@ -191,9 +191,9 @@ class DispatchSimulator:
     def apply_nemde_dispatch_algorithm(self, rrp_value: float, price_bands: Dict[str, float],
                                        current_allocation: Dict[str, float], maxavail: float) -> Dict[str, Any]:
         """
-        Apply NEMDE's top-down dispatch algorithm with proper band-specific tracking.
+        Apply NEMDE's top-down dispatch algorithm with PROPER band availability checking.
 
-        FIXED: Now returns detailed breakdown of which bands were dispatched.
+        FIXED: Now properly respects individual band allocation limits.
         """
         start_time = time.perf_counter()
 
@@ -227,7 +227,7 @@ class DispatchSimulator:
         remaining_maxavail = maxavail
         maxavail_constraint_applied = False
 
-        # FIXED: Track dispatch breakdown by band
+        # FIXED: Track dispatch breakdown by band with PROPER availability checking
         band_dispatch_breakdown = {}
 
         # Process bands in order until MAXAVAIL is exhausted
@@ -236,19 +236,21 @@ class DispatchSimulator:
                 maxavail_constraint_applied = True
                 break
 
-            # Dispatch up to remaining MAXAVAIL or full BANDAVAIL
-            band_dispatch = min(band['bandavail'], remaining_maxavail)
+            # CRITICAL FIX: Dispatch up to MINIMUM of (band availability, remaining MAXAVAIL)
+            available_in_band = band['bandavail']
+            band_dispatch = min(available_in_band, remaining_maxavail)
 
             if band_dispatch > 0.001:
                 dispatched_mw += band_dispatch
                 remaining_maxavail -= band_dispatch
                 dispatched_bands.append(band['band_name'])
 
-                # FIXED: Track specific band dispatch amounts
+                # FIXED: Track actual dispatch amounts per band
                 band_dispatch_breakdown[band['band_name']] = band_dispatch
 
                 self.logger.debug(f"NEMDE: Dispatched {band_dispatch:.2f}MW from {band['band_name']} "
-                                  f"@ ${band['price']:.2f} (Remaining MAXAVAIL: {remaining_maxavail:.2f}MW)")
+                                  f"@ ${band['price']:.2f} (Available in band: {available_in_band:.2f}MW, "
+                                  f"Remaining MAXAVAIL: {remaining_maxavail:.2f}MW)")
 
                 if remaining_maxavail <= 0.001:
                     maxavail_constraint_applied = True
@@ -265,7 +267,12 @@ class DispatchSimulator:
 
         processing_time_ms = (time.perf_counter() - start_time) * 1000
 
-        # FIXED: Return enhanced result with band dispatch breakdown
+        # Enhanced validation logging
+        total_requested = sum(band['bandavail'] for band in dispatchable_bands)
+        self.logger.debug(f"NEMDE Result: Dispatched {dispatched_mw:.2f}MW from {len(dispatched_bands)} bands. "
+                          f"Requested: {total_requested:.2f}MW, MAXAVAIL: {maxavail:.2f}MW")
+
+        # FIXED: Return enhanced result with proper band dispatch breakdown
         result = {
             'dispatched_mw': dispatched_mw,
             'dispatched_bands': dispatched_bands,
@@ -275,7 +282,7 @@ class DispatchSimulator:
             'constraint_applied': constraint_applied,
             'total_bandavail': total_bandavail,
             'dispatchable_bandavail': sum(band['bandavail'] for band in dispatchable_bands),
-            'band_dispatch_breakdown': band_dispatch_breakdown,  # FIXED: Added breakdown
+            'band_dispatch_breakdown': band_dispatch_breakdown,
             'processing_time_ms': processing_time_ms,
             'eligible_bands_count': len(dispatchable_bands)
         }
@@ -298,28 +305,46 @@ class DispatchSimulator:
             'eligible_bands_count': 0
         }
 
-    def validate_ramp_constraints_post_dispatch(self, dispatched_mw: float) -> Dict[str, Any]:
+    def validate_ramp_constraints_post_dispatch(self, dispatched_mw: float, maxavail: float = None) -> Dict[str, Any]:
         """
-        Final validation that dispatch respects ramp constraints.
-        INTERFACE UNCHANGED - Enhanced with better error tracking.
+        Final validation that dispatch respects ramp constraints WITHOUT exceeding MAXAVAIL.
+
+        FIXED: Properly enforces constraint hierarchy: MAXAVAIL > Ramp > Physical
         """
         ramp_change = dispatched_mw - self.previous_dispatch_mw
-        tolerance = 0.001  # Small tolerance for floating point precision
+        tolerance = 0.001
 
         # Check if ramp change exceeds limits
         if abs(ramp_change) > self.max_ramp_5min + tolerance:
             original_dispatch = dispatched_mw
 
             if ramp_change > 0:
+                # Ramping up: limit to previous + max ramp
                 corrected_dispatch = self.previous_dispatch_mw + self.max_ramp_5min
             else:
+                # Ramping down: limit to previous - max ramp (but not below 0)
                 corrected_dispatch = max(0, self.previous_dispatch_mw - self.max_ramp_5min)
 
-            self.logger.warning(f"Ramp constraint violation detected: "
-                              f"Change={ramp_change:.2f}MW exceeds limit={self.max_ramp_5min:.2f}MW. "
-                              f"Correcting dispatch from {dispatched_mw:.2f}MW to {corrected_dispatch:.2f}MW")
+            # CRITICAL FIX 1: Ensure corrected dispatch NEVER exceeds MAXAVAIL
+            if maxavail is not None:
+                corrected_dispatch = min(corrected_dispatch, maxavail)
 
-            # Enhanced tracking
+            # CRITICAL FIX 2: Ensure corrected dispatch NEVER exceeds original NEMDE result
+            corrected_dispatch = min(corrected_dispatch, original_dispatch)
+
+            # Enhanced logging
+            constraints_applied = []
+            if maxavail is not None and corrected_dispatch == maxavail:
+                constraints_applied.append(f"MAXAVAIL({maxavail:.2f}MW)")
+            if corrected_dispatch == original_dispatch:
+                constraints_applied.append("NEMDE-limit")
+
+            constraint_description = " + ".join(constraints_applied) if constraints_applied else "ramp-only"
+
+            self.logger.info(f"Ramp constraint applied: {dispatched_mw:.2f}MW → {corrected_dispatch:.2f}MW "
+                             f"(change: {ramp_change:.2f}MW, limit: ±{self.max_ramp_5min:.2f}MW, "
+                             f"constraints: {constraint_description})")
+
             violation_magnitude = abs(ramp_change) - self.max_ramp_5min
 
             return {
@@ -327,23 +352,25 @@ class DispatchSimulator:
                 'ramp_violation_detected': True,
                 'original_dispatch': original_dispatch,
                 'ramp_change': corrected_dispatch - self.previous_dispatch_mw,
-                'violation_magnitude': violation_magnitude  # NEW field
+                'violation_magnitude': violation_magnitude,
+                'constraints_applied': constraints_applied
             }
 
         return {
             'corrected_dispatch': dispatched_mw,
             'ramp_violation_detected': False,
             'ramp_change': ramp_change,
-            'violation_magnitude': 0.0  # NEW field
+            'violation_magnitude': 0.0,
+            'constraints_applied': []
         }
 
     def simulate_dispatch_for_interval(self, rrp_value: float, price_bands: Dict[str, float],
                                        strategy_manager, strategy_name: str, interval_number: int,
                                        timestamp: datetime) -> DispatchResult:
         """
-        Simulate dispatch for a single interval with proper sequential NEMDE integration.
+        Simulate dispatch for a single interval with FIXED data flow and validation.
 
-        FIXED: Ensures proper data flow and method calling sequence.
+        FIXED: Uses atomic updates and proper constraint enforcement.
         """
         self.current_interval = interval_number
 
@@ -355,7 +382,7 @@ class DispatchSimulator:
             # Calculate MAXAVAIL
             maxavail = self.calculate_maxavail(remaining_soc, interval_number)
 
-            # FIXED: Get current bid schedule WITHOUT MAXAVAIL scaling
+            # Get current bid schedule
             current_allocation = strategy_manager.get_bid_schedule_with_maxavail_check(
                 strategy_name, interval_number, maxavail
             )
@@ -369,14 +396,41 @@ class DispatchSimulator:
             return self._create_empty_dispatch_result(timestamp, interval_number, rrp_value,
                                                       remaining_soc, final_override_active, current_allocation)
 
-        # Apply NEMDE dispatch algorithm
+        # STEP 1: Apply FIXED NEMDE dispatch algorithm
         nemde_result = self.apply_nemde_dispatch_algorithm(
             rrp_value, price_bands, current_allocation, maxavail
         )
 
-        # Apply ramp constraints
-        ramp_validation = self.validate_ramp_constraints_post_dispatch(nemde_result['dispatched_mw'])
+        # STEP 2: Apply ramp constraints WITH MAXAVAIL limit
+        ramp_validation = self.validate_ramp_constraints_post_dispatch(
+            nemde_result['dispatched_mw'], maxavail
+        )
         final_dispatch = ramp_validation['corrected_dispatch']
+
+        # STEP 3: Scale NEMDE breakdown if ramp constraint was applied
+        if final_dispatch < nemde_result['dispatched_mw'] and nemde_result['dispatched_mw'] > 0:
+            scaling_factor = final_dispatch / nemde_result['dispatched_mw']
+            scaled_breakdown = {band: amount * scaling_factor
+                                for band, amount in nemde_result['band_dispatch_breakdown'].items()}
+            self.logger.debug(f"Ramp constraint scaling applied: {scaling_factor:.6f}")
+        else:
+            scaled_breakdown = nemde_result['band_dispatch_breakdown']
+
+        # STEP 4: ATOMIC update of strategy state
+        if final_dispatch > 0:
+            try:
+                # Use NEW atomic update method
+                capacity_remains = strategy_manager.update_strategy_after_dispatch(
+                    strategy_name, final_dispatch, scaled_breakdown, interval_number
+                )
+            except Exception as e:
+                self.logger.error(f"ATOMIC UPDATE FAILED for {strategy_name}: {e}")
+                # Fallback to original methods
+                strategy_manager.update_after_dispatch(strategy_name, final_dispatch, interval_number)
+
+        # STEP 5: Get post-dispatch state for result
+        post_dispatch_soc = strategy_manager.get_remaining_soc(strategy_name)
+        post_dispatch_allocation = strategy_manager.get_bid_schedule(strategy_name, interval_number)
 
         # Determine dispatch status
         if final_dispatch <= 0.01:
@@ -389,34 +443,11 @@ class DispatchSimulator:
         # Calculate revenue with TLF
         revenue = final_dispatch * (rrp_value / 12) * self.tlf
 
-        # FIXED: Update strategy manager with the proper sequence
-        if final_dispatch > 0:
-            # 1. First update remaining SOC
-            strategy_manager.update_after_dispatch(strategy_name, final_dispatch, interval_number)
-
-            # 2. Then update specific band allocations based on NEMDE dispatch
-            if hasattr(strategy_manager, 'update_band_allocations_after_nemde_dispatch'):
-                # Scale the breakdown if ramp constraint was applied
-                if final_dispatch < nemde_result['dispatched_mw']:
-                    scaling_factor = final_dispatch / nemde_result['dispatched_mw']
-                    scaled_breakdown = {band: amount * scaling_factor
-                                        for band, amount in nemde_result['band_dispatch_breakdown'].items()}
-                    self.logger.debug(f"Ramp constraint applied: scaling NEMDE breakdown by {scaling_factor:.3f}")
-                else:
-                    scaled_breakdown = nemde_result['band_dispatch_breakdown']
-
-                # CRITICAL: Update band allocations based on actual dispatch
-                strategy_manager.update_band_allocations_after_nemde_dispatch(strategy_name, scaled_breakdown)
-            else:
-                self.logger.error("update_band_allocations_after_nemde_dispatch method not available")
-
-        # Get post-dispatch state for the result
-        post_dispatch_soc = strategy_manager.get_remaining_soc(strategy_name)
-        post_dispatch_allocation = strategy_manager.get_bid_schedule(strategy_name, interval_number)
-
+        # Get override flags
         final_override_active = strategy_manager.was_final_override_applied(strategy_name)
         minimum_floor_active = strategy_manager.was_minimum_floor_applied(strategy_name)
-        # Create dispatch result
+
+        # STEP 6: Create dispatch result with enhanced validation
         dispatch_result = DispatchResult(
             timestamp=timestamp,
             interval_number=interval_number,
@@ -439,6 +470,14 @@ class DispatchSimulator:
             maxavail_constraint_applied=nemde_result['maxavail_constraint_applied'],
             nemde_processing_time_ms=nemde_result.get('processing_time_ms', 0.0)
         )
+
+        # STEP 7: Final validation logging
+        allocation_sum = sum(post_dispatch_allocation.values())
+        if abs(allocation_sum - post_dispatch_soc) > 0.01:
+            self.logger.error(f"FINAL VALIDATION FAILED - {strategy_name} Interval {interval_number}:")
+            self.logger.error(f"  SOC: {post_dispatch_soc:.3f}MW, Allocation sum: {allocation_sum:.3f}MW")
+
+        validation_result = self.validate_dispatch_consistency(dispatch_result)
 
         # Update tracking
         self.previous_dispatch_mw = final_dispatch
@@ -483,6 +522,55 @@ class DispatchSimulator:
             'constraint_applied': constraint_applied,
             'original_request': original_request
         }
+
+    def validate_dispatch_consistency(self, dispatch_result: DispatchResult) -> Dict[str, Any]:
+        """
+        Validate the dispatch result for consistency and log any issues.
+
+        NEW METHOD: Comprehensive validation of dispatch logic.
+        """
+        issues = []
+
+        # Check 1: Dispatch vs MAXAVAIL
+        if dispatch_result.dispatched_mw > dispatch_result.maxavail_for_interval + 0.001:
+            issues.append(
+                f"Dispatched ({dispatch_result.dispatched_mw:.3f}MW) > MAXAVAIL ({dispatch_result.maxavail_for_interval:.3f}MW)")
+
+        # Check 2: SOC vs Allocation consistency
+        if dispatch_result.strategy_allocation:
+            allocation_sum = sum(dispatch_result.strategy_allocation.values())
+            if abs(allocation_sum - dispatch_result.remaining_soc) > 0.01:
+                issues.append(f"SOC ({dispatch_result.remaining_soc:.3f}MW) ≠ Allocation sum ({allocation_sum:.3f}MW)")
+
+        # Check 3: Band dispatch feasibility
+        if dispatch_result.dispatched_bands and dispatch_result.strategy_allocation:
+            for band_name in dispatch_result.dispatched_bands:
+                band_allocation = dispatch_result.strategy_allocation.get(band_name, 0)
+                if band_allocation < 0:
+                    issues.append(f"Negative allocation in dispatched band {band_name}: {band_allocation:.3f}MW")
+
+        # Check 4: Revenue calculation
+        expected_revenue = dispatch_result.dispatched_mw * (dispatch_result.rrp / 12) * self.tlf
+        if abs(dispatch_result.revenue - expected_revenue) > 0.01:
+            issues.append(f"Revenue mismatch: Expected {expected_revenue:.2f}, Got {dispatch_result.revenue:.2f}")
+
+        validation_result = {
+            'is_valid': len(issues) == 0,
+            'issues': issues,
+            'interval': dispatch_result.interval_number,
+            'strategy': dispatch_result.strategy_name
+        }
+
+        if issues:
+            self.logger.warning(
+                f"DISPATCH VALIDATION ISSUES - {dispatch_result.strategy_name} Interval {dispatch_result.interval_number}:")
+            for issue in issues:
+                self.logger.warning(f"  ❌ {issue}")
+        else:
+            self.logger.debug(
+                f"✅ Dispatch validation passed - {dispatch_result.strategy_name} Interval {dispatch_result.interval_number}")
+
+        return validation_result
 
     def simulate_daily_dispatch(self,
                               current_day_data: pd.DataFrame,
